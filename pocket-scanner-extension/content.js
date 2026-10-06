@@ -1,201 +1,959 @@
-// Pocket Option Scanner Overlay
-// Analysis only — never places trades.
+/*
+ Pocket Option Scanner
+ Live page-data listener
+ Analysis only - NO automatic trading
 
-(function () {
-  "use strict";
+ This script:
+ - Hooks page WebSockets
+ - Watches Socket.IO/WebSocket messages
+ - Attempts to extract prices/candles
+ - Builds 1-minute candles from price ticks
+ - Calculates EMA, RSI, Bollinger Bands, MACD and ATR
+ - Displays BUY / SELL / WAIT
+ - Never clicks CALL/PUT
+ - Never places trades
+*/
 
-  if (window.__PO_SCANNER_LOADED__) return;
-  window.__PO_SCANNER_LOADED__ = true;
+(() => {
+    "use strict";
 
-  const panel = document.createElement("div");
+    const STATE = {
+        symbol: "Detecting market...",
+        candles: [],
+        currentCandle: null,
+        lastPrice: null,
+        lastMessage: null,
+        connected: false,
+        messages: 0,
+        signal: "WAIT",
+        confidence: 0,
+        reason: "Waiting for live market data"
+    };
 
-  panel.id = "po-scanner-panel";
+    const MAX_CANDLES = 300;
+    const CANDLE_SECONDS = 60;
 
-  panel.innerHTML = `
-    <div class="po-header">
-      <span>PO SCANNER</span>
-      <button id="po-minimize">−</button>
-    </div>
+    // ------------------------------------------------------------
+    // Utility
+    // ------------------------------------------------------------
 
-    <div class="po-body">
+    function number(value) {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : null;
+    }
 
-      <div class="po-market">
-        <span>MARKET</span>
-        <strong id="po-market">Detecting...</strong>
-      </div>
+    function nowSeconds() {
+        return Math.floor(Date.now() / 1000);
+    }
 
-      <div class="po-timeframe">
-        <span>TIMEFRAME</span>
-        <strong>1 MIN</strong>
-      </div>
+    function candleStart(timestamp) {
+        return Math.floor(timestamp / CANDLE_SECONDS) * CANDLE_SECONDS;
+    }
 
-      <div id="po-signal" class="po-signal">
-        WAIT
-      </div>
+    function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+    }
 
-      <div class="po-confidence">
-        Confidence:
-        <strong id="po-confidence">0%</strong>
-      </div>
+    // ------------------------------------------------------------
+    // Indicator functions
+    // ------------------------------------------------------------
 
-      <div class="po-info">
-        <div>Price: <span id="po-price">--</span></div>
-        <div>RSI: <span id="po-rsi">--</span></div>
-        <div>EMA 9: <span id="po-ema9">--</span></div>
-        <div>EMA 21: <span id="po-ema21">--</span></div>
-        <div>EMA 50: <span id="po-ema50">--</span></div>
-      </div>
+    function ema(values, period) {
+        if (values.length < period) return null;
 
-      <div class="po-reason">
-        <strong>Analysis</strong>
-        <p id="po-reason">
-          Waiting for chart data...
-        </p>
-      </div>
+        const multiplier = 2 / (period + 1);
 
-      <button id="po-scan-button">
-        SCAN MARKET
-      </button>
+        let result = 0;
 
-      <div class="po-status" id="po-status">
-        Scanner ready
-      </div>
+        for (let i = 0; i < period; i++) {
+            result += values[i];
+        }
 
-    </div>
-  `;
+        result /= period;
 
-  document.body.appendChild(panel);
+        for (let i = period; i < values.length; i++) {
+            result =
+                (values[i] - result) * multiplier +
+                result;
+        }
 
-  const marketElement =
-    document.querySelector(
-      '[class*="asset"], [class*="symbol"], [class*="instrument"]'
-    );
+        return result;
+    }
 
-  if (marketElement) {
-    document.getElementById("po-market").textContent =
-      marketElement.textContent.trim().slice(0, 30);
-  }
+    function rsi(values, period = 14) {
+        if (values.length < period + 1) return null;
 
-  function getVisiblePrices() {
-    /*
-      This first version looks for numeric price values
-      visible in the Pocket Option page.
+        let gains = 0;
+        let losses = 0;
 
-      If Pocket Option exposes the chart data through
-      canvas/WebSocket rather than normal page text,
-      the live-data connector will be added separately.
-    */
+        for (let i = values.length - period; i < values.length; i++) {
+            const change = values[i] - values[i - 1];
 
-    const numbers = [];
+            if (change > 0) {
+                gains += change;
+            } else {
+                losses += Math.abs(change);
+            }
+        }
 
-    const elements = document.querySelectorAll(
-      "span, div, td"
-    );
+        if (losses === 0) return 100;
 
-    elements.forEach((element) => {
-      const text = element.textContent.trim();
+        const rs = gains / losses;
 
-      if (/^\d+(\.\d+)?$/.test(text)) {
-        const number = Number(text);
+        return 100 - (100 / (1 + rs));
+    }
+
+    function bollinger(values, period = 20, multiplier = 2) {
+        if (values.length < period) return null;
+
+        const recent = values.slice(-period);
+
+        const mean =
+            recent.reduce((a, b) => a + b, 0) /
+            recent.length;
+
+        const variance =
+            recent.reduce(
+                (sum, value) =>
+                    sum + Math.pow(value - mean, 2),
+                0
+            ) / recent.length;
+
+        const deviation = Math.sqrt(variance);
+
+        return {
+            middle: mean,
+            upper: mean + multiplier * deviation,
+            lower: mean - multiplier * deviation
+        };
+    }
+
+    function macd(values) {
+        if (values.length < 35) return null;
+
+        const fast = ema(values, 12);
+        const slow = ema(values, 26);
+
+        if (fast === null || slow === null) {
+            return null;
+        }
+
+        return fast - slow;
+    }
+
+    function atr(candles, period = 14) {
+        if (candles.length < period + 1) {
+            return null;
+        }
+
+        const ranges = [];
+
+        for (
+            let i = candles.length - period;
+            i < candles.length;
+            i++
+        ) {
+            const current = candles[i];
+            const previous = candles[i - 1];
+
+            const trueRange = Math.max(
+                current.high - current.low,
+                Math.abs(current.high - previous.close),
+                Math.abs(current.low - previous.close)
+            );
+
+            ranges.push(trueRange);
+        }
+
+        return (
+            ranges.reduce((a, b) => a + b, 0) /
+            ranges.length
+        );
+    }
+
+    // ------------------------------------------------------------
+    // Analysis
+    // ------------------------------------------------------------
+
+    function analyze() {
+        const candles = STATE.candles;
+
+        if (candles.length < 50) {
+            STATE.signal = "WAIT";
+            STATE.confidence = 0;
+            STATE.reason =
+                `Collecting candles (${candles.length}/50)`;
+            updatePanel();
+            return;
+        }
+
+        const closes = candles.map(c => c.close);
+
+        const price = closes[closes.length - 1];
+
+        const ema9 = ema(closes, 9);
+        const ema21 = ema(closes, 21);
+        const ema50 = ema(closes, 50);
+
+        const rsiValue = rsi(closes, 14);
+
+        const bands =
+            bollinger(closes, 20, 2);
+
+        const macdValue =
+            macd(closes);
+
+        const atrValue =
+            atr(candles, 14);
 
         if (
-          number > 0 &&
-          number < 1000000 &&
-          Number.isFinite(number)
+            ema9 === null ||
+            ema21 === null ||
+            ema50 === null ||
+            rsiValue === null ||
+            bands === null
         ) {
-          numbers.push(number);
+            STATE.signal = "WAIT";
+            STATE.confidence = 0;
+            STATE.reason = "Indicators are still loading";
+            updatePanel();
+            return;
         }
-      }
-    });
 
-    return numbers.slice(-300);
-  }
+        let buyScore = 0;
+        let sellScore = 0;
 
-  function scan() {
-    const prices = getVisiblePrices();
+        const reasons = [];
+
+        // EMA trend
+        if (
+            ema9 > ema21 &&
+            ema21 > ema50
+        ) {
+            buyScore += 2;
+            reasons.push("bullish EMA trend");
+        }
+
+        if (
+            ema9 < ema21 &&
+            ema21 < ema50
+        ) {
+            sellScore += 2;
+            reasons.push("bearish EMA trend");
+        }
+
+        // Price vs EMA
+        if (price > ema21) {
+            buyScore += 1;
+        }
+
+        if (price < ema21) {
+            sellScore += 1;
+        }
+
+        // RSI
+        if (rsiValue > 50 && rsiValue < 70) {
+            buyScore += 2;
+            reasons.push("RSI bullish");
+        }
+
+        if (rsiValue < 50 && rsiValue > 30) {
+            sellScore += 2;
+            reasons.push("RSI bearish");
+        }
+
+        // Bollinger
+        if (price > bands.middle) {
+            buyScore += 1;
+        }
+
+        if (price < bands.middle) {
+            sellScore += 1;
+        }
+
+        // MACD
+        if (macdValue !== null) {
+            if (macdValue > 0) {
+                buyScore += 1;
+            }
+
+            if (macdValue < 0) {
+                sellScore += 1;
+            }
+        }
+
+        const maximumScore = 7;
+
+        if (
+            buyScore >= 5 &&
+            buyScore > sellScore
+        ) {
+            STATE.signal = "BUY";
+            STATE.confidence =
+                clamp(
+                    Math.round(
+                        (buyScore / maximumScore) * 100
+                    ),
+                    0,
+                    99
+                );
+        } else if (
+            sellScore >= 5 &&
+            sellScore > buyScore
+        ) {
+            STATE.signal = "SELL";
+            STATE.confidence =
+                clamp(
+                    Math.round(
+                        (sellScore / maximumScore) * 100
+                    ),
+                    0,
+                    99
+                );
+        } else {
+            STATE.signal = "WAIT";
+            STATE.confidence =
+                Math.round(
+                    Math.max(
+                        buyScore,
+                        sellScore
+                    ) / maximumScore * 100
+                );
+        }
+
+        STATE.reason =
+            reasons.length
+                ? reasons.join(" • ")
+                : "No strong alignment";
+
+        updatePanel();
+    }
+
+    // ------------------------------------------------------------
+    // Candle builder
+    // ------------------------------------------------------------
+
+    function addPrice(price, timestamp = nowSeconds()) {
+        price = number(price);
+
+        if (price === null || price <= 0) {
+            return;
+        }
+
+        STATE.lastPrice = price;
+
+        const start =
+            candleStart(timestamp);
+
+        if (
+            !STATE.currentCandle ||
+            STATE.currentCandle.time !== start
+        ) {
+            if (STATE.currentCandle) {
+                STATE.candles.push(
+                    STATE.currentCandle
+                );
+
+                if (
+                    STATE.candles.length >
+                    MAX_CANDLES
+                ) {
+                    STATE.candles.shift();
+                }
+            }
+
+            STATE.currentCandle = {
+                time: start,
+                open: price,
+                high: price,
+                low: price,
+                close: price
+            };
+        } else {
+            STATE.currentCandle.high =
+                Math.max(
+                    STATE.currentCandle.high,
+                    price
+                );
+
+            STATE.currentCandle.low =
+                Math.min(
+                    STATE.currentCandle.low,
+                    price
+                );
+
+            STATE.currentCandle.close =
+                price;
+        }
+
+        STATE.connected = true;
+
+        analyze();
+    }
+
+    // ------------------------------------------------------------
+    // Generic data extraction
+    // ------------------------------------------------------------
+
+    function inspectObject(obj) {
+        if (!obj) return;
+
+        // Common symbol fields
+        const symbol =
+            obj.symbol ||
+            obj.asset ||
+            obj.active ||
+            obj.pair ||
+            obj.instrument ||
+            obj.ticker;
+
+        if (
+            typeof symbol === "string" &&
+            symbol.length < 40
+        ) {
+            STATE.symbol = symbol;
+        }
+
+        // Direct price fields
+        const priceFields = [
+            "price",
+            "close",
+            "value",
+            "rate",
+            "quote",
+            "ask",
+            "bid"
+        ];
+
+        for (const field of priceFields) {
+            if (obj[field] !== undefined) {
+                const p = number(obj[field]);
+
+                if (p !== null && p > 0) {
+                    const timestamp =
+                        number(
+                            obj.timestamp ||
+                            obj.time ||
+                            obj.ts
+                        ) || nowSeconds();
+
+                    addPrice(
+                        p,
+                        timestamp > 10000000000
+                            ? Math.floor(timestamp / 1000)
+                            : timestamp
+                    );
+
+                    return;
+                }
+            }
+        }
+
+        // OHLC object
+        if (
+            obj.open !== undefined &&
+            obj.high !== undefined &&
+            obj.low !== undefined &&
+            obj.close !== undefined
+        ) {
+            const o = number(obj.open);
+            const h = number(obj.high);
+            const l = number(obj.low);
+            const c = number(obj.close);
+
+            if (
+                o !== null &&
+                h !== null &&
+                l !== null &&
+                c !== null
+            ) {
+                const timestamp =
+                    number(
+                        obj.timestamp ||
+                        obj.time ||
+                        obj.ts
+                    ) || nowSeconds();
+
+                const t =
+                    timestamp > 10000000000
+                        ? Math.floor(timestamp / 1000)
+                        : timestamp;
+
+                const existing =
+                    STATE.candles.find(
+                        x => x.time === candleStart(t)
+                    );
+
+                if (!existing) {
+                    STATE.candles.push({
+                        time: candleStart(t),
+                        open: o,
+                        high: h,
+                        low: l,
+                        close: c
+                    });
+
+                    STATE.candles =
+                        STATE.candles
+                            .slice(-MAX_CANDLES);
+
+                    STATE.lastPrice = c;
+                    STATE.connected = true;
+
+                    analyze();
+                }
+            }
+
+            return;
+        }
+
+        // Recursively inspect nested objects
+        for (const key of Object.keys(obj)) {
+            const value = obj[key];
+
+            if (
+                value &&
+                typeof value === "object"
+            ) {
+                inspectObject(value);
+            }
+        }
+    }
+
+    function inspectArray(arr) {
+        if (!Array.isArray(arr)) return;
+
+        // Try nested structures first
+        for (const item of arr) {
+            if (
+                item &&
+                typeof item === "object"
+            ) {
+                inspectObject(item);
+            }
+        }
+
+        // Common OHLC array formats:
+        // [timestamp, open, high, low, close]
+        // [timestamp, open, close, high, low]
+        if (arr.length >= 5) {
+            for (let i = 0; i <= arr.length - 5; i++) {
+                const t = number(arr[i]);
+                const a = number(arr[i + 1]);
+                const b = number(arr[i + 2]);
+                const c = number(arr[i + 3]);
+                const d = number(arr[i + 4]);
+
+                if (
+                    t !== null &&
+                    a !== null &&
+                    b !== null &&
+                    c !== null &&
+                    d !== null &&
+                    t > 1000000000
+                ) {
+                    const timestamp =
+                        t > 10000000000
+                            ? Math.floor(t / 1000)
+                            : t;
+
+                    const values = [a, b, c, d];
+
+                    const high =
+                        Math.max(...values);
+
+                    const low =
+                        Math.min(...values);
+
+                    const close = d;
+
+                    STATE.candles.push({
+                        time:
+                            candleStart(timestamp),
+                        open: a,
+                        high,
+                        low,
+                        close
+                    });
+
+                    STATE.candles =
+                        STATE.candles
+                            .slice(-MAX_CANDLES);
+
+                    STATE.lastPrice = close;
+                    STATE.connected = true;
+                }
+            }
+
+            analyze();
+        }
+    }
+
+    function inspectMessage(data) {
+        STATE.messages++;
+
+        if (typeof data !== "string") {
+            return;
+        }
+
+        STATE.lastMessage =
+            data.slice(0, 500);
+
+        let text = data.trim();
+
+        // Socket.IO often prefixes JSON
+        // with a numeric frame identifier.
+        text = text.replace(
+            /^[0-9]+-/,
+            ""
+        );
+
+        // Remove Socket.IO packet prefix
+        if (
+            text.startsWith("42")
+        ) {
+            text = text.slice(2);
+        }
+
+        try {
+            const parsed =
+                JSON.parse(text);
+
+            if (Array.isArray(parsed)) {
+                inspectArray(parsed);
+
+                if (
+                    parsed.length > 1
+                ) {
+                    inspectObject(
+                        parsed[1]
+                    );
+                }
+            } else {
+                inspectObject(parsed);
+            }
+
+            return;
+        } catch (_) {
+            // Not plain JSON.
+        }
+
+        // Look for numeric price-like values
+        // inside raw messages as a fallback.
+        const matches =
+            text.match(
+                /(?:price|close|value|rate)["']?\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)/gi
+            );
+
+        if (matches) {
+            for (const match of matches) {
+                const numberMatch =
+                    match.match(
+                        /([0-9]+(?:\.[0-9]+)?)$/
+                    );
+
+                if (numberMatch) {
+                    addPrice(
+                        Number(numberMatch[1])
+                    );
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------
+    // WebSocket interception
+    // ------------------------------------------------------------
+
+    const OriginalWebSocket =
+        window.WebSocket;
 
     if (
-      !window.PocketOptionScanner ||
-      prices.length < 50
+        OriginalWebSocket &&
+        !window.__PO_SCANNER_WS_HOOKED__
     ) {
-      document.getElementById("po-status").textContent =
-        "Waiting for live chart data...";
+        window.__PO_SCANNER_WS_HOOKED__ = true;
 
-      document.getElementById("po-reason").textContent =
-        "Open a Pocket Option chart and wait for market data.";
+        const PatchedWebSocket =
+            function(...args) {
 
-      return;
+                const socket =
+                    new OriginalWebSocket(...args);
+
+                socket.addEventListener(
+                    "open",
+                    () => {
+                        STATE.connected = true;
+                        updatePanel();
+                    }
+                );
+
+                socket.addEventListener(
+                    "message",
+                    event => {
+                        inspectMessage(
+                            event.data
+                        );
+                    }
+                );
+
+                socket.addEventListener(
+                    "close",
+                    () => {
+                        updatePanel();
+                    }
+                );
+
+                return socket;
+            };
+
+        PatchedWebSocket.prototype =
+            OriginalWebSocket.prototype;
+
+        Object.defineProperty(
+            PatchedWebSocket,
+            "CONNECTING",
+            { value: 0 }
+        );
+
+        Object.defineProperty(
+            PatchedWebSocket,
+            "OPEN",
+            { value: 1 }
+        );
+
+        Object.defineProperty(
+            PatchedWebSocket,
+            "CLOSING",
+            { value: 2 }
+        );
+
+        Object.defineProperty(
+            PatchedWebSocket,
+            "CLOSED",
+            { value: 3 }
+        );
+
+        window.WebSocket =
+            PatchedWebSocket;
     }
 
-    const result =
-      window.PocketOptionScanner.analyze(prices);
+    // ------------------------------------------------------------
+    // Overlay
+    // ------------------------------------------------------------
 
-    document.getElementById("po-signal").textContent =
-      result.signal;
+    function createPanel() {
+        if (
+            document.getElementById(
+                "po-scanner-panel"
+            )
+        ) {
+            return;
+        }
 
-    document.getElementById("po-confidence").textContent =
-      result.confidence + "%";
+        const panel =
+            document.createElement("div");
 
-    document.getElementById("po-price").textContent =
-      result.price;
+        panel.id =
+            "po-scanner-panel";
 
-    document.getElementById("po-rsi").textContent =
-      result.rsi;
+        panel.innerHTML = `
+            <div class="po-scanner-header">
+                <strong>PO MARKET SCANNER</strong>
+                <button id="po-minimize">−</button>
+            </div>
 
-    document.getElementById("po-ema9").textContent =
-      result.ema9;
+            <div class="po-scanner-body">
 
-    document.getElementById("po-ema21").textContent =
-      result.ema21;
+                <div class="po-row">
+                    <span>Market</span>
+                    <b id="po-market">
+                        Detecting...
+                    </b>
+                </div>
 
-    document.getElementById("po-ema50").textContent =
-      result.ema50;
+                <div class="po-row">
+                    <span>Timeframe</span>
+                    <b>1 MIN</b>
+                </div>
 
-    document.getElementById("po-reason").textContent =
-      result.reason;
+                <div id="po-signal">
+                    WAIT
+                </div>
 
-    document.getElementById("po-status").textContent =
-      "Analysis updated";
+                <div class="po-confidence">
+                    Confidence:
+                    <b id="po-confidence">
+                        0%
+                    </b>
+                </div>
 
-    const signal =
-      document.getElementById("po-signal");
+                <div class="po-row">
+                    <span>Price</span>
+                    <b id="po-price">—</b>
+                </div>
 
-    signal.className = "po-signal";
+                <div class="po-row">
+                    <span>RSI</span>
+                    <b id="po-rsi">—</b>
+                </div>
 
-    if (result.signal.includes("BUY")) {
-      signal.classList.add("buy");
-    } else if (result.signal.includes("SELL")) {
-      signal.classList.add("sell");
+                <div class="po-row">
+                    <span>EMA 9</span>
+                    <b id="po-ema9">—</b>
+                </div>
+
+                <div class="po-row">
+                    <span>EMA 21</span>
+                    <b id="po-ema21">—</b>
+                </div>
+
+                <div class="po-row">
+                    <span>EMA 50</span>
+                    <b id="po-ema50">—</b>
+                </div>
+
+                <div id="po-status">
+                    Waiting for live market data
+                </div>
+
+                <div id="po-reason">
+                    Waiting for candles...
+                </div>
+
+                <div class="po-disclaimer">
+                    Analysis only • No automatic trading
+                </div>
+
+            </div>
+        `;
+
+        document.documentElement.appendChild(
+            panel
+        );
+
+        const minimize =
+            document.getElementById(
+                "po-minimize"
+            );
+
+        const body =
+            panel.querySelector(
+                ".po-scanner-body"
+            );
+
+        minimize.onclick = () => {
+            const hidden =
+                body.style.display === "none";
+
+            body.style.display =
+                hidden ? "block" : "none";
+
+            minimize.textContent =
+                hidden ? "−" : "+";
+        };
+    }
+
+    function updatePanel() {
+        const panel =
+            document.getElementById(
+                "po-scanner-panel"
+            );
+
+        if (!panel) return;
+
+        const market =
+            document.getElementById(
+                "po-market"
+            );
+
+        const signal =
+            document.getElementById(
+                "po-signal"
+            );
+
+        const confidence =
+            document.getElementById(
+                "po-confidence"
+            );
+
+        const price =
+            document.getElementById(
+                "po-price"
+            );
+
+        const status =
+            document.getElementById(
+                "po-status"
+            );
+
+        const reason =
+            document.getElementById(
+                "po-reason"
+            );
+
+        if (market) {
+            market.textContent =
+                STATE.symbol;
+        }
+
+        if (signal) {
+            signal.textContent =
+                STATE.signal;
+        }
+
+        if (confidence) {
+            confidence.textContent =
+                `${STATE.confidence}%`;
+        }
+
+        if (price) {
+            price.textContent =
+                STATE.lastPrice !== null
+                    ? String(
+                        STATE.lastPrice
+                    )
+                    : "—";
+        }
+
+        if (status) {
+            status.textContent =
+                STATE.connected
+                    ? `Live data received • ${STATE.messages} messages`
+                    : "Waiting for live market data";
+        }
+
+        if (reason) {
+            reason.textContent =
+                STATE.reason;
+        }
+    }
+
+    // ------------------------------------------------------------
+    // Startup
+    // ------------------------------------------------------------
+
+    function start() {
+        createPanel();
+        updatePanel();
+
+        setInterval(
+            updatePanel,
+            1000
+        );
+    }
+
+    if (
+        document.readyState ===
+        "loading"
+    ) {
+        document.addEventListener(
+            "DOMContentLoaded",
+            start,
+            { once: true }
+        );
     } else {
-      signal.classList.add("wait");
+        start();
     }
-  }
-
-  document
-    .getElementById("po-scan-button")
-    .addEventListener("click", scan);
-
-  document
-    .getElementById("po-minimize")
-    .addEventListener("click", () => {
-
-      const body =
-        document.querySelector(".po-body");
-
-      if (body.style.display === "none") {
-        body.style.display = "block";
-        document.getElementById(
-          "po-minimize"
-        ).textContent = "−";
-      } else {
-        body.style.display = "none";
-        document.getElementById(
-          "po-minimize"
-        ).textContent = "+";
-      }
-    });
-
-  // Initial scan
-  setTimeout(scan, 3000);
 
 })();
