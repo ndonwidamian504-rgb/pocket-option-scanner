@@ -17,8 +17,10 @@
         "https://*.pocketoption.com/*"
       ],
       "js": [
-        "scanner.js",
-        "content.js"
+  "scanner.js",
+  "content.js"
+],
+"world": "MAIN",
       ],
       "css": [
         "style.css"
