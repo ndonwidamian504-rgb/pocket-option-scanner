@@ -1,0 +1,135 @@
+#po-scanner-panel {
+  position: fixed;
+  top: 90px;
+  right: 20px;
+  width: 300px;
+  z-index: 2147483647;
+  background: #111827;
+  color: #ffffff;
+  font-family: Arial, sans-serif;
+  border: 1px solid #374151;
+  border-radius: 12px;
+  box-shadow: 0 10px 35px rgba(0,0,0,0.45);
+  overflow: hidden;
+}
+
+#po-scanner-panel .po-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 14px;
+  background: #0b1220;
+  font-weight: 700;
+  font-size: 14px;
+}
+
+#po-minimize {
+  border: 0;
+  background: transparent;
+  color: #ffffff;
+  font-size: 20px;
+  cursor: pointer;
+}
+
+#po-scanner-panel .po-body {
+  padding: 14px;
+}
+
+.po-market,
+.po-timeframe {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.po-market span,
+.po-timeframe span {
+  color: #9ca3af;
+}
+
+.po-signal {
+  text-align: center;
+  font-size: 24px;
+  font-weight: 800;
+  padding: 14px 8px;
+  margin: 12px 0;
+  border-radius: 8px;
+}
+
+.po-signal.wait {
+  background: #374151;
+}
+
+.po-signal.buy {
+  background: #065f46;
+}
+
+.po-signal.sell {
+  background: #991b1b;
+}
+
+.po-confidence {
+  text-align: center;
+  margin-bottom: 14px;
+  font-size: 14px;
+}
+
+.po-info {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+  font-size: 12px;
+  margin-bottom: 14px;
+}
+
+.po-info div {
+  background: #1f2937;
+  padding: 8px;
+  border-radius: 6px;
+}
+
+.po-info span {
+  font-weight: 700;
+}
+
+.po-reason {
+  background: #1f2937;
+  padding: 10px;
+  border-radius: 7px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.po-reason strong {
+  display: block;
+  margin-bottom: 5px;
+}
+
+.po-reason p {
+  margin: 0;
+  color: #d1d5db;
+}
+
+#po-scan-button {
+  width: 100%;
+  margin-top: 12px;
+  padding: 10px;
+  border: 0;
+  border-radius: 7px;
+  background: #2563eb;
+  color: #ffffff;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+#po-scan-button:hover {
+  background: #1d4ed8;
+}
+
+.po-status {
+  text-align: center;
+  margin-top: 9px;
+  color: #9ca3af;
+  font-size: 11px;
+}
