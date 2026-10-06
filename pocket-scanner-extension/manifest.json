@@ -1,1 +1,32 @@
-
+{
+  "manifest_version": 3,
+  "name": "Pocket Option Basilisk-Style Scanner",
+  "version": "1.0.0",
+  "description": "Analysis-only Pocket Option chart scanner.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://pocketoption.com/*",
+    "https://*.pocketoption.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://pocketoption.com/*",
+        "https://*.pocketoption.com/*"
+      ],
+      "js": [
+        "scanner.js",
+        "content.js"
+      ],
+      "css": [
+        "style.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Pocket Option Scanner"
+  }
+}
