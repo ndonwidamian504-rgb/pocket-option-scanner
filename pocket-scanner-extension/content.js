@@ -679,8 +679,35 @@
     document.addEventListener(
       "DOMContentLoaded",
       start
+    );// Receive WebSocket frames captured by background.js
+
+chrome.runtime.onMessage.addListener(
+  message => {
+
+    if (
+      message?.type !==
+      "POCKET_OPTION_WS_FRAME"
+    ) {
+      return;
+    }
+
+    const payload = message.payload;
+
+    console.log(
+      "[Pocket Scanner] Network frame received:",
+      payload
     );
-  } else {
+
+    try {
+      processSocketMessage(payload);
+    } catch (error) {
+      console.log(
+        "[Pocket Scanner] Frame processing error:",
+        error
+      );
+    }
+  }
+);  } else {
     start();
   }
 
